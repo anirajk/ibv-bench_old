@@ -1385,7 +1385,7 @@ rdmaRead2(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
     ibv_sge isge[remoteVACount];
 
     for (uint32_t i = 0 ; i < remoteVACount; ++i) {
-        LOG(INFO, "%d bytesPerVA %u remoteVA %lu %u", i, bytesPerVA, remoteVAs[i], rkey);
+//        LOG(INFO, "%d bytesPerVA %u remoteVA %lu %u", i, bytesPerVA, remoteVAs[i], rkey);
         isge[i] = {
             reinterpret_cast<uint64_t>(bd->buffer) + (bytesPerVA * i),
             bytesPerVA,
@@ -1406,8 +1406,8 @@ rdmaRead2(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
     }
 
     for (uint32_t i = 0 ; i < remoteVACount; ++i) {
-        ibv_send_wr& wr = txWorkRequests[i];
-        LOG(INFO,
+/*        ibv_send_wr& wr = txWorkRequests[i];
+          LOG(INFO,
             "wr[%d]:\n"
             "wr_id: %lu\n"
             "next: %p\n"
@@ -1420,6 +1420,7 @@ rdmaRead2(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
             i, wr.wr_id, wr.next, wr.sg_list, wr.num_sge, wr.opcode,
             wr.send_flags, wr.wr.rdma.remote_addr, wr.wr.rdma.rkey);
 
+*/
     }
 
     ibv_send_wr *bad_txWorkRequest;
@@ -1431,7 +1432,7 @@ rdmaRead2(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
 
     if (r) {
         LOG(ERROR, "ibv_post_send failed errno %d %s", errno, strerror(errno));
-        DIE("ibv_post_send failed for RDMA Read of 0x%lx with rkey 0x%x",
+        DIE("ibv_post_send failed for RDMA Read2 of 0x%lx with rkey 0x%x",
                 remoteVAs[0], rkey);
     }
 
@@ -1765,7 +1766,7 @@ void registerMemory(void* base, size_t bytes)
 
 QueuePair* clientQP = nullptr;
 
-enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
+enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_READ2 , MODE_ALL };
 
 static const int messages = 10 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
@@ -1803,6 +1804,7 @@ uint64_t benchSend()
 uint64_t benchRDMAWrite()
 {
     Chunk chunks[nChunks];
+    //int count=0;
     uint32_t start = 0;
     for (size_t i = 0; i < nChunks; ++i) {
         start = generateRandom();
@@ -1817,6 +1819,7 @@ uint64_t benchRDMAWrite()
         while (rdmaWrite(clientQP, chunks, nChunks, nChunks * chunkSize,
                             remoteLogVA + start, remoteLogRkey) == ENOMEM)
         {
+        //    count++;
             reapTxBuffers();
         }
         if ((i % 100000) == 0) {
@@ -1825,13 +1828,38 @@ uint64_t benchRDMAWrite()
         }
     }
 
+    //LOG(ERROR, "Total ENOMEMs avoided in write:%d",count);
     return counter.stop();
 }
 
 uint64_t benchRDMARead()
 {
     CycleCounter<> counter{};
+   // int count=0;
+    for (int i = 0; i < messages; ++i) {
+        BufferDescriptor* bd = getTransmitBuffer();
 
+            uint64_t start = generateRandom();
+            start = start % (logSize - chunkSize);
+
+        while (rdmaRead(clientQP, bd, chunkSize,
+                        remoteLogVA + start, remoteLogRkey) == ENOMEM)
+        {
+     //    count++;
+        }
+        if ((i % 100000) == 0) {
+            LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
+        }
+	}
+    //LOG(ERROR, "Total ENOMEMs avoided in RDMARead:%d",count);
+    return counter.stop();
+}
+
+
+uint64_t benchRDMARead2()
+{
+    CycleCounter<> counter{};
+    //int count=0;
     for (int i = 0; i < messages; ++i) {
         BufferDescriptor* bd = getTransmitBuffer();
 
@@ -1844,19 +1872,16 @@ uint64_t benchRDMARead()
             remoteVAs[i] = remoteLogVA + start;
         }
 
-        while (rdmaRead2(clientQP, bd, chunkSize,
-                        &remoteVAs[0], 32, remoteLogRkey) == ENOMEM)
-        //while (rdmaRead(clientQP, bd, chunkSize,
-        //                remoteLogVA + start, remoteLogRkey) == ENOMEM)
-        {
-        }
+        rdmaRead2(clientQP, bd, chunkSize, &remoteVAs[0], 32, remoteLogRkey);
         if ((i % 100000) == 0) {
             LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
         }
     }
-
+   // LOG(ERROR, "Total ENOMEMs avoided in RDMARead2:%d",count);
     return counter.stop();
 }
+
+
 
 void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, uint32_t sgLen)
 {
@@ -1923,6 +1948,18 @@ void measure() {
         cycles = benchRDMARead();
         dumpStats(MODE_READ, cycles, 1, 1);
     }
+    sleep(5);
+    reapTxBuffers();
+    if (mode == MODE_READ2 || mode == MODE_ALL) {
+        uint32_t sgLen = MAX_TX_SGE_COUNT = 1;
+        LOG(INFO, "Running reads(multiple  wqe) with sgLen %d", sgLen);
+        // RDMA Read can only fetch 1 item per op.
+        // Doesn't matter for RDMA logic below, but final stat dump multiplies
+        // by nChunks, so this needs to be right to get correct stats out.
+        cycles = benchRDMARead2();
+        dumpStats(MODE_READ2, cycles, 1, 1);
+    }
+
 }
 
 static const char USAGE[] =
@@ -1939,7 +1976,7 @@ R"(ibv-bench.
       --chunkSize=SIZE           Size of individual objects [default: 100]
       --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
       --sgLength=SGLEN           Max S/G list length [default: 32]
-      --mode=MODE                send, read, write, or all [default: all]
+      --mode=MODE                send, read, write, read2 or all [default: all]
 )";
 
 int main(int argc, const char** argv)
@@ -1969,8 +2006,9 @@ int main(int argc, const char** argv)
         mode = MODE_WRITE;
     } else if (args["--mode"].asString() == "read") {
         mode = MODE_READ;
+    } else if (args["--mode"].asString() == "read2") {
+        mode = MODE_READ2;
     }
-
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
 
