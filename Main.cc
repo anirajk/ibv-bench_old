@@ -1376,7 +1376,7 @@ rdmaRead(QueuePair* qp, BufferDescriptor *bd, uint32_t bytes,
 }
 
 int
-rdmaRead2(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
+rdmaReadMultiple(QueuePair* qp, BufferDescriptor* bd, uint32_t bytesPerVA,
           uint64_t* remoteVAs, uint32_t remoteVACount, uint32_t rkey)
 {
     assert(bytesPerVA * remoteVACount <= bd->bytes);
@@ -1657,13 +1657,6 @@ struct Header
     char message[0];
 };
 
-void
-handleMessage(BufferDescriptor* bd, uint32_t len)
-{
-    //Header& header = *reinterpret_cast<Header*>(bd->buffer);
-    //LOG(ERROR, "Handling a message of length %u!", len);
-    //LOG(ERROR, "Message was %s!", header.message);
-}
 
 int
 poll()
@@ -1727,7 +1720,6 @@ poll()
 
             //port->portAlarm.requestArrived(); // Restarts the port watchdog
             //r->rpcServiceTime.start();
-            handleMessage(bd, request->byte_len);
         }
     }
 
@@ -1766,7 +1758,7 @@ void registerMemory(void* base, size_t bytes)
 
 QueuePair* clientQP = nullptr;
 
-enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_READ2 , MODE_ALL };
+enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_READ_MUL_WQE , MODE_ALL };
 
 static const int messages = 10 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
@@ -1863,6 +1855,28 @@ uint64_t benchRDMARead2()
     for (int i = 0; i < messages; ++i) {
         BufferDescriptor* bd = getTransmitBuffer();
 
+            uint64_t start = generateRandom();
+            start = start % (logSize - chunkSize);
+
+        while (rdmaRead(clientQP, bd, chunkSize,
+                        remoteLogVA + start, remoteLogRkey) == ENOMEM)
+        {
+        }
+        if ((i % 100000) == 0) {
+            LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
+        }
+	}
+    return counter.stop();
+}
+
+
+uint64_t benchrdmaReadMultiple()
+{
+    CycleCounter<> counter{};
+
+    for (int i = 0; i < messages; ++i) {
+        BufferDescriptor* bd = getTransmitBuffer();
+
         //uint64_t start = 0;
 
         uint64_t remoteVAs[32];
@@ -1872,7 +1886,12 @@ uint64_t benchRDMARead2()
             remoteVAs[i] = remoteLogVA + start;
         }
 
-        rdmaRead2(clientQP, bd, chunkSize, &remoteVAs[0], 32, remoteLogRkey);
+        while (rdmaReadMultiple(clientQP, bd, chunkSize,
+                        &remoteVAs[0], 32, remoteLogRkey) == ENOMEM)
+        //while (rdmaRead(clientQP, bd, chunkSize,
+        //                remoteLogVA + start, remoteLogRkey) == ENOMEM)
+        {
+        }
         if ((i % 100000) == 0) {
             LOG(ERROR, "Chunks rx zero-copy RDMA read: %u (%lu errors)", i + 1, txFailures);
         }
@@ -1950,14 +1969,14 @@ void measure() {
     }
     sleep(5);
     reapTxBuffers();
-    if (mode == MODE_READ2 || mode == MODE_ALL) {
+    if (mode == MODE_READ_MUL_WQE || mode == MODE_ALL) {
         uint32_t sgLen = MAX_TX_SGE_COUNT = 1;
         LOG(INFO, "Running reads(multiple  wqe) with sgLen %d", sgLen);
         // RDMA Read can only fetch 1 item per op.
         // Doesn't matter for RDMA logic below, but final stat dump multiplies
         // by nChunks, so this needs to be right to get correct stats out.
-        cycles = benchRDMARead2();
-        dumpStats(MODE_READ2, cycles, 1, 1);
+        cycles = benchrdmaReadMultiple();
+        dumpStats(MODE_READ_MUL_WQE, cycles, 1, 1);
     }
 
 }
@@ -1976,7 +1995,7 @@ R"(ibv-bench.
       --chunkSize=SIZE           Size of individual objects [default: 100]
       --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
       --sgLength=SGLEN           Max S/G list length [default: 32]
-      --mode=MODE                send, read, write, read2 or all [default: all]
+      --mode=MODE                send, read, write, multiread or all [default: all]
 )";
 
 int main(int argc, const char** argv)
@@ -2006,8 +2025,8 @@ int main(int argc, const char** argv)
         mode = MODE_WRITE;
     } else if (args["--mode"].asString() == "read") {
         mode = MODE_READ;
-    } else if (args["--mode"].asString() == "read2") {
-        mode = MODE_READ2;
+    } else if (args["--mode"].asString() == "multiread") {
+        mode = MODE_READ_MUL_WQE;
     }
     LOG(INFO, "Running as %s with %s",
             isServer ? "server" : "client", hostName);
