@@ -1765,7 +1765,7 @@ void registerMemory(void* base, size_t bytes)
 
 QueuePair* clientQP = nullptr;
 
-enum Mode { MODE_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
+enum Mode { MODE_SEND, MODE_MIXED_SEND, MODE_WRITE, MODE_READ, MODE_ALL };
 
 static const int messages = 10 * 1000 * 1000;
 static const size_t logSize = 4lu * 1024 * 1024 * 1024;
@@ -1799,6 +1799,42 @@ uint64_t benchSend()
 
     return counter.stop();
 }
+
+uint64_t benchMixedSend(uint32_t numZeroCopy)
+{
+    Chunk chunks[nChunks];
+    uint32_t start = 0;
+    uint32_t copyout = 0;
+    size_t i;
+    for (i = 0; i < numZeroCopy; ++i) {
+        start = generateRandom();
+        start = start % (logSize - chunkSize);
+        chunks[i].p = (void*)(logMemoryBase + start);
+        chunks[i].len = chunkSize;
+    }
+    copyout = (nChunks-numZeroCopy) * chunkSize;
+    if(copyout){
+        start = generateRandom();
+        start = start % (logSize - chunkSize);
+        chunks[i].p = (void *) (logMemoryBase + start);
+        chunks[i].len = (nChunks-numZeroCopy) * chunkSize;
+        numZeroCopy++;
+    }
+
+    CycleCounter<> counter{};
+
+    for (int i = 0; i < messages ; ++i) {
+        sendZeroCopy(chunks, numZeroCopy, (nChunks - numZeroCopy) * chunkSize, clientQP);
+        if ((i % 100000) == 0) {
+            LOG(ERROR, "Chunks tx zero-copy: %u / %u",
+                chunksTransmittedZeroCopy, chunksTransmitted);
+        }
+    }
+
+    return counter.stop();
+}
+
+
 
 uint64_t benchRDMAWrite()
 {
@@ -1860,12 +1896,24 @@ uint64_t benchRDMARead()
 
 void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, uint32_t sgLen)
 {
+    printf("> mode sgLen mbs usPerMessage\n");
     double seconds = Cycles::toSeconds(cycles);
     double mbs =
       (double(messages * chunksPerMessage * chunkSize) / (1u << 20)) / seconds;
     double usPerMessage = seconds / messages * 1e6;
     printf("> %d %u %0.2f %0.3f\n", mode, sgLen, mbs, usPerMessage);
 }
+
+void dumpMixedStats(Mode mode, uint64_t cycles, int chunksPerMessage, uint32_t zeroCopybytes)
+{
+
+    double seconds = Cycles::toSeconds(cycles);
+    double mbs =
+            (double(messages * chunksPerMessage * chunkSize) / (1u << 20)) / seconds;
+    double usPerMessage = seconds / messages * 1e6;
+    printf("> mixedSend %u %0.2f %0.3f\n", zeroCopybytes, mbs, usPerMessage);
+}
+
 
 void measure() {
     /* Some junk to do synchronous sends, non-zero-copy
@@ -1889,7 +1937,7 @@ void measure() {
     }
     */
 
-    printf("> mode sgLen mbs usPerMessage\n");
+
 
     uint64_t cycles = 0;
     if (mode == MODE_SEND || mode == MODE_ALL) {
@@ -1900,7 +1948,18 @@ void measure() {
             dumpStats(MODE_SEND, cycles, nChunks, sgLen);
         }
     }
+    sleep(5);
+    reapTxBuffers();
+    if (mode == MODE_MIXED_SEND || mode == MODE_ALL){
+        MAX_TX_SGE_COUNT=32;
+        printf("> mode zeroCopybytes mbs usPerMessage\n");
+        for (uint32_t numZeroCopy = 0; numZeroCopy < MAX_TX_SGE_COUNT; ++numZeroCopy) {
+            LOG(INFO, "Running sends with %d bytes zero copied", numZeroCopy);
+            cycles = benchMixedSend(numZeroCopy);
+            dumpMixedStats(MODE_MIXED_SEND, cycles, nChunks, numZeroCopy);
+        }
 
+    }
     sleep(5);
     reapTxBuffers();
 
@@ -1939,7 +1998,7 @@ R"(ibv-bench.
       --chunkSize=SIZE           Size of individual objects [default: 100]
       --chunksPerMessage=CHUNKS  Number of objects to send per send/write, ignored for read [default: 32]
       --sgLength=SGLEN           Max S/G list length [default: 32]
-      --mode=MODE                send, read, write, or all [default: all]
+      --mode=MODE                send, mixedsend, read, write, or all [default: all]
 )";
 
 int main(int argc, const char** argv)
@@ -1965,7 +2024,9 @@ int main(int argc, const char** argv)
     mode = MODE_ALL;
     if (args["--mode"].asString() == "send") {
         mode = MODE_SEND;
-    } else if (args["--mode"].asString() == "write") {
+    } else if (args["--mode"].asString()== "mixedsend"){
+        mode = MODE_MIXED_SEND;
+    }else if (args["--mode"].asString() == "write") {
         mode = MODE_WRITE;
     } else if (args["--mode"].asString() == "read") {
         mode = MODE_READ;
