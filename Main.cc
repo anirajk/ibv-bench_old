@@ -1253,6 +1253,118 @@ sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair
     }
 }
 
+
+
+
+
+void
+sendMixedCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool copyOutChunk)
+{
+    const bool allowZeroCopy = true;
+    uint32_t lastChunkIndex = chunkCount - 1;
+    ibv_sge isge[MAX_TX_SGE_COUNT];
+
+    uint32_t chunksUsed = 0;
+    uint32_t sgesUsed = 0;
+    BufferDescriptor* bd = getTransmitBuffer();
+    bd->messageBytes = messageLen;
+
+    // The variables below allow us to collect several chunks from the
+    // Buffer into a single sge in some situations. They describe a
+    // range of bytes in bd that have not yet been put in an sge, but
+    // must go into the next sge.
+    char* unaddedStart = bd->buffer;
+    char* unaddedEnd = bd->buffer;
+
+    int chunksZeroCopied = 0;
+
+    for (uint32_t i = 0 ; i < chunkCount; ++i) {
+        Chunk& chunk = message[i];
+
+        const uintptr_t addr = reinterpret_cast<const uintptr_t>(chunk.p);
+        // See if we can transmit this chunk from its current location
+        // (zero copy) vs. copying it into a transmit buffer:
+        // * The chunk must lie in the range of registered memory that
+        //   the NIC knows about.
+        // * If we run out of sges, then everything has to be copied
+        //   (but save the last sge for the last chunk, since it's the
+        //   one most likely to benefit from zero copying.
+        // * For small chunks, it's cheaper to copy than to send a
+        //   separate descriptor to the NIC.
+        //
+        //   stutsman: hold back one SGE for any data copied to the tx buffer,
+        //   *unless* this is the last chunk *and* the tx buffer is empty.
+        bool inBounds = addr >= logMemoryBase &&
+                        (addr + chunk.len) <= (logMemoryBase + logMemoryBytes);
+        bool stillRoom = (sgesUsed < MAX_TX_SGE_COUNT - 1 ||
+                          ((chunksUsed == lastChunkIndex) &&
+                           (unaddedStart == unaddedEnd)));
+        bool lastCopyOutChunk = !(copyOutChunk && (i==chunkCount-1));
+        if (allowZeroCopy && stillRoom && inBounds &&
+            chunk.len > MIN_CHUNK_ZERO_COPY_LEN && lastCopyOutChunk)
+        {
+            if (unaddedStart != unaddedEnd) {
+                isge[sgesUsed] = {
+                        reinterpret_cast<uint64_t>(unaddedStart),
+                        uint32_t(unaddedEnd - unaddedStart),
+                        bd->mr->lkey
+                };
+                ++sgesUsed;
+                unaddedStart = unaddedEnd;
+            }
+
+            isge[sgesUsed] = {
+                    addr,
+                    chunk.len,
+                    logMemoryRegion->lkey
+            };
+            ++sgesUsed;
+            ++chunksZeroCopied;
+        } else {
+            memcpy(unaddedEnd, chunk.p, chunk.len);
+            unaddedEnd += chunk.len;
+        }
+        ++chunksUsed;
+    }
+    if (unaddedStart != unaddedEnd) {
+        isge[sgesUsed] = {
+                reinterpret_cast<uint64_t>(unaddedStart),
+                uint32_t(unaddedEnd - unaddedStart),
+                bd->mr->lkey
+        };
+        ++sgesUsed;
+        unaddedStart = unaddedEnd;
+    }
+
+    ibv_send_wr txWorkRequest;
+
+    memset(&txWorkRequest, 0, sizeof(txWorkRequest));
+    txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
+    txWorkRequest.next = NULL;
+    txWorkRequest.sg_list = isge;
+    txWorkRequest.num_sge = sgesUsed;
+    txWorkRequest.opcode = IBV_WR_SEND;
+    txWorkRequest.send_flags = IBV_SEND_SIGNALED;
+
+    // We can get a substantial latency improvement (nearly 2usec less per RTT)
+    // by inlining data with the WQE for small messages. The Verbs library
+    // automatically takes care of copying from the SGEs to the WQE.
+    if (messageLen <= MAX_INLINE_DATA)
+        txWorkRequest.send_flags |= IBV_SEND_INLINE;
+
+    chunksTransmitted += chunksUsed;
+    chunksTransmittedZeroCopy += chunksZeroCopied;
+
+    ibv_send_wr* badTxWorkRequest;
+    if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
+        DIE("ibv_post_send failed");
+    }
+}
+
+
+
+
+
 /**
  * Asychronously transmit the packet described by 'bd' on queue pair 'qp'.
  * This function returns immediately. 
@@ -1822,9 +1934,9 @@ uint64_t benchMixedSend(uint32_t numZeroCopy)
     }
 
     CycleCounter<> counter{};
-
+    bool copyoutflag = (copyout!=0);
     for (int i = 0; i < messages ; ++i) {
-        sendZeroCopy(chunks, numZeroCopy, (nChunks - numZeroCopy) * chunkSize, clientQP);
+        sendMixedCopy(chunks, numZeroCopy, (nChunks - numZeroCopy) * chunkSize, clientQP, copyoutflag);
         if ((i % 100000) == 0) {
             LOG(ERROR, "Chunks tx zero-copy: %u / %u",
                 chunksTransmittedZeroCopy, chunksTransmitted);
