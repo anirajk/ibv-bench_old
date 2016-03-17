@@ -1858,13 +1858,13 @@ uint64_t benchRDMARead()
     return counter.stop();
 }
 
-void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, size_t currSize)
+void dumpStats(int mode, uint64_t cycles, int chunksPerMessage, size_t currSize)
 {
     double seconds = Cycles::toSeconds(cycles);
     double mbs =
       (double(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
     double usPerMessage = seconds / messages * 1e6;
-    printf("> %d %l %l %0.2f %0.3f\n", mode, chunksPerMessage, currSize, mbs, usPerMessage);
+    printf("> %d %d %lu %0.2f %0.3f\n", mode, chunksPerMessage, currSize, mbs, usPerMessage);
 }
 
 void measure() {
@@ -1893,18 +1893,17 @@ void measure() {
 
     uint64_t cycles = 0;
     if (mode == MODE_SEND || mode == MODE_ALL) {
-        bool zerocopy= true;
         size_t iternChunks;
         size_t iterChunkSize;
-        MAX_TX_SGE_COUNT = sgLen;
+        MAX_TX_SGE_COUNT = 32;
         for (iternChunks = 1; iternChunks <= 32; ++iternChunks) {
             nChunks = iternChunks;
             for (iterChunkSize=1;iterChunkSize <=1024;iterChunkSize*=2){
                 chunkSize = iterChunkSize;
-                LOG(INFO, "Running zerocopy with chunkSize:%l number of chunks:%l", nChunks, chunkSize);
+                LOG(INFO, "Running zerocopy with %lu chunks per message of size:%lu", nChunks, chunkSize);
                 cycles = benchSend(true);
                 dumpStats(0, cycles, nChunks, chunkSize);
-                LOG(INFO, "Running copy all with chunkSize:%l number of chunks:%l", nChunks, chunkSize);
+                LOG(INFO, "Running copy all with %lu chunks per message of size:%lu", nChunks, chunkSize);
                 cycles = benchSend(false);
                 dumpStats(1, cycles, nChunks, chunkSize);
             }
@@ -1915,7 +1914,7 @@ void measure() {
             nChunks = iternChunks;
             for (iterChunkSize=1;iterChunkSize <=1024;iterChunkSize*=2){
                 chunkSize = iterChunkSize;
-                LOG(INFO, "Running copy all with chunkSize:%l number of chunks:%l", nChunks, chunkSize);
+                LOG(INFO, "Running copy all with %lu chunks per message of size:%lu", nChunks, chunkSize);
                 cycles = benchSend(false);
                 dumpStats(1, cycles, nChunks, chunkSize);
             }
