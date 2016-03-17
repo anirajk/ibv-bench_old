@@ -1151,9 +1151,9 @@ int chunksTransmitted = 0;
 int chunksTransmittedZeroCopy = 0;
 
 void
-sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp)
+sendZeroCopy(Chunk* message, uint32_t chunkCount, uint32_t messageLen, QueuePair* qp, bool allowZeroCopy)
 {
-    const bool allowZeroCopy = true;
+
     uint32_t lastChunkIndex = chunkCount - 1;
     ibv_sge isge[MAX_TX_SGE_COUNT];
 
@@ -1776,7 +1776,7 @@ bool useHugePages = false;
 size_t chunkSize = 100;
 size_t nChunks = 32;
 
-uint64_t benchSend()
+uint64_t benchSend(bool doZeroCopy)
 {
     Chunk chunks[nChunks];
     uint32_t start = 0;
@@ -1790,7 +1790,7 @@ uint64_t benchSend()
     CycleCounter<> counter{};
 
     for (int i = 0; i < messages ; ++i) {
-        sendZeroCopy(chunks, nChunks, nChunks * chunkSize, clientQP);
+        sendZeroCopy(chunks, nChunks, nChunks * chunkSize, clientQP, doZeroCopy);
         if ((i % 100000) == 0) {
             LOG(ERROR, "Chunks tx zero-copy: %u / %u",
                     chunksTransmittedZeroCopy, chunksTransmitted);
@@ -1858,13 +1858,13 @@ uint64_t benchRDMARead()
     return counter.stop();
 }
 
-void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, uint32_t sgLen)
+void dumpStats(Mode mode, uint64_t cycles, int chunksPerMessage, size_t currSize)
 {
     double seconds = Cycles::toSeconds(cycles);
     double mbs =
-      (double(messages * chunksPerMessage * chunkSize) / (1u << 20)) / seconds;
+      (double(messages * chunksPerMessage * currSize) / (1u << 20)) / seconds;
     double usPerMessage = seconds / messages * 1e6;
-    printf("> %d %u %0.2f %0.3f\n", mode, sgLen, mbs, usPerMessage);
+    printf("> %d %l %l %0.2f %0.3f\n", mode, chunksPerMessage, currSize, mbs, usPerMessage);
 }
 
 void measure() {
@@ -1889,15 +1889,38 @@ void measure() {
     }
     */
 
-    printf("> mode sgLen mbs usPerMessage\n");
+    printf("> copied #chunks chunksize mbs usPerMessage\n");
 
     uint64_t cycles = 0;
     if (mode == MODE_SEND || mode == MODE_ALL) {
-        for (uint32_t sgLen = 1; sgLen <= 32; ++sgLen) {
-            MAX_TX_SGE_COUNT = sgLen;
-            LOG(INFO, "Running sends with sgLen %d", sgLen);
-            cycles = benchSend();
-            dumpStats(MODE_SEND, cycles, nChunks, sgLen);
+        bool zerocopy= true;
+        size_t iternChunks;
+        size_t iterChunkSize;
+        MAX_TX_SGE_COUNT = sgLen;
+        for (iternChunks = 1; iternChunks <= 32; ++iternChunks) {
+            nChunks = iternChunks;
+            for (iterChunkSize=1;iterChunkSize <=1024;iterChunkSize*=2){
+                chunkSize = iterChunkSize;
+                LOG(INFO, "Running zerocopy with chunkSize:%l number of chunks:%l", nChunks, chunkSize);
+                cycles = benchSend(true);
+                dumpStats(0, cycles, nChunks, chunkSize);
+                LOG(INFO, "Running copy all with chunkSize:%l number of chunks:%l", nChunks, chunkSize);
+                cycles = benchSend(false);
+                dumpStats(1, cycles, nChunks, chunkSize);
+            }
+            sleep(5);
+            reapTxBuffers();
+        }
+        for (iternChunks = 64; iternChunks <= 1024; iternChunks*=2) {
+            nChunks = iternChunks;
+            for (iterChunkSize=1;iterChunkSize <=1024;iterChunkSize*=2){
+                chunkSize = iterChunkSize;
+                LOG(INFO, "Running copy all with chunkSize:%l number of chunks:%l", nChunks, chunkSize);
+                cycles = benchSend(false);
+                dumpStats(1, cycles, nChunks, chunkSize);
+            }
+            sleep(5);
+            reapTxBuffers();
         }
     }
 
