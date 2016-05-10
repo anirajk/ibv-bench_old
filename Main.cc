@@ -48,6 +48,10 @@ static const uint32_t MAX_TX_QUEUE_DEPTH = 16;
 uint32_t MAX_TX_SGE_COUNT = 26;
 const uint32_t MIN_CHUNK_ZERO_COPY_LEN = 0;
 
+// multiclient versions of queue constants for scaling
+uint32_t MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS = 32;
+uint32_t MAX_TX_QUEUE_DEPTH_NCLIENTS = 16;
+
 static const uint32_t QP_EXCHANGE_MAX_TIMEOUTS = 10;
 
 #define HTONS(x) \
@@ -105,10 +109,10 @@ struct BufferDescriptor {
 };
 
 void* rxBase;
-BufferDescriptor rxDescriptors[MAX_SHARED_RX_QUEUE_DEPTH * 2];
+BufferDescriptor rxDescriptors[MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS * 2];
 
 void* txBase;
-BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH];
+BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH_NCLIENTS];
 
 std::vector<BufferDescriptor*> freeTxBuffers{};
 
@@ -870,7 +874,7 @@ handleFileEvent()
             commonTxCq,
             serverRxCq,
             MAX_TX_QUEUE_DEPTH,
-            MAX_SHARED_RX_QUEUE_DEPTH);
+            MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS);
     qp->plumb(&incomingQpt);
     qp->setPeerName(incomingQpt.getPeerName());
     LOG(DEBUG, "New queue pair for %s:%u, nonce 0x%lx, remote log VA 0x%lx, "
@@ -1661,6 +1665,10 @@ void initGlobals(uint8_t numClients)
     memCpyCycles = new uint64_t[numClients]();
     chunksTransmitted = new uint64_t[numClients]();
     chunksTransmittedZeroCopy = new uint64_t[numClients]();
+    MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS *= numClients;
+    MAX_TX_QUEUE_DEPTH_NCLIENTS *= numClients;
+
+    
 }
 
 void resetCycles(uint8_t tid){
