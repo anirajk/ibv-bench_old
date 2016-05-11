@@ -109,10 +109,10 @@ struct BufferDescriptor {
 };
 
 void* rxBase;
-BufferDescriptor rxDescriptors[MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS * 2];
+BufferDescriptor *rxDescriptors;
 
 void* txBase;
-BufferDescriptor txDescriptors[MAX_TX_QUEUE_DEPTH_NCLIENTS];
+BufferDescriptor *txDescriptors;
 
 std::vector<BufferDescriptor*> freeTxBuffers{};
 
@@ -873,7 +873,7 @@ handleFileEvent()
             serverSrq,
             commonTxCq,
             serverRxCq,
-            MAX_TX_QUEUE_DEPTH,
+            MAX_TX_QUEUE_DEPTH_NCLIENTS,
             MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS);
     qp->plumb(&incomingQpt);
     qp->setPeerName(incomingQpt.getPeerName());
@@ -1012,11 +1012,11 @@ bool setup(bool isServer)
     // to these queues only. the motiviation is to avoid having to post at
     // least one buffer to every single queue pair (we may have thousands of
     // them with megabyte buffers).
-    serverSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
+    serverSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS,
                                          MAX_SHARED_RX_SGE_COUNT);
     check_error_null(serverSrq,
                      "failed to create server shared receive queue");
-    clientSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
+    clientSrq = createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS,
                                          MAX_SHARED_RX_SGE_COUNT);
     check_error_null(clientSrq,
                      "failed to create client shared receive queue");
@@ -1031,36 +1031,35 @@ bool setup(bool isServer)
     uint32_t bufferSize = ((1u << 23) + 4095) & ~0xfff;
 
     createBuffers(&rxBase, rxDescriptors, bufferSize,
-                  uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2));
+                  uint32_t(MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS * 2));
     uint32_t j = 0;
-    for (auto& bd : rxDescriptors) {
-        if (j < MAX_SHARED_RX_QUEUE_DEPTH)
-            postSrqReceiveAndKickTransmit(serverSrq, &bd);
+    for (;j<sizeof(rxDescriptors)/sizeof(*rxDescriptors);++j) {
+        if (j < MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS)
+            postSrqReceiveAndKickTransmit(serverSrq, &rxDescriptors[j]);
         else
-            postSrqReceiveAndKickTransmit(clientSrq, &bd);
-        ++j;
+            postSrqReceiveAndKickTransmit(clientSrq, &rxDescriptors[j]);
     }
     //assert(numUsedClientSrqBuffers == 0);
 
     createBuffers(&txBase, txDescriptors,
-                  bufferSize, uint32_t(MAX_TX_QUEUE_DEPTH));
-    for (auto& bd : txDescriptors)
-        freeTxBuffers.push_back(&bd);
+                  bufferSize, uint32_t(MAX_TX_QUEUE_DEPTH_NCLIENTS));
+    for (j=0;j<sizeof(txDescriptors)/sizeof(*txDescriptors);++j)
+        freeTxBuffers.push_back(&txDescriptors[j]);
 
     // create completion queues for server receive, client receive, and
     // server/client transmit
     serverRxCq =
-            ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
+            ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS, NULL, NULL, 0);
     check_error_null(serverRxCq,
                      "failed to create server receive completion queue");
 
     clientRxCq =
-            ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH, NULL, NULL, 0);
+            ibv_create_cq(ctxt, MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS, NULL, NULL, 0);
     check_error_null(clientRxCq,
                      "failed to create client receive completion queue");
 
     commonTxCq =
-            ibv_create_cq(ctxt, MAX_TX_QUEUE_DEPTH, NULL, NULL, 0);
+            ibv_create_cq(ctxt, MAX_TX_QUEUE_DEPTH_NCLIENTS, NULL, NULL, 0);
     check_error_null(commonTxCq,
                      "failed to create transmit completion queue");
 
@@ -1109,8 +1108,8 @@ uint64_t txFailures = 0;
 int
 reapTxBuffers()
 {
-    ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
-    int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH, retArray);
+    ibv_wc retArray[MAX_TX_QUEUE_DEPTH_NCLIENTS];
+    int n = ibv_poll_cq(commonTxCq, MAX_TX_QUEUE_DEPTH_NCLIENTS, retArray);
 
     for (int i = 0; i < n; i++) {
         BufferDescriptor* bd =
@@ -1453,8 +1452,8 @@ clientTrySetupQueuePair(uint16_t port)
         QueuePair *qp = new QueuePair(IBV_QPT_RC,
                                       clientSrq,
                                       commonTxCq, clientRxCq,
-                                      MAX_TX_QUEUE_DEPTH,
-                                      MAX_SHARED_RX_QUEUE_DEPTH);
+                                      MAX_TX_QUEUE_DEPTH_NCLIENTS,
+                                      MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS);
         uint32_t i;
         uint64_t nonce = rand();
         LOG(DEBUG, "starting to connect to %s via local port %d, nonce 0x%lx",
@@ -1667,8 +1666,8 @@ void initGlobals(uint8_t numClients)
     chunksTransmittedZeroCopy = new uint64_t[numClients]();
     MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS *= numClients;
     MAX_TX_QUEUE_DEPTH_NCLIENTS *= numClients;
-
-    
+    rxDescriptors = new BufferDescriptor[MAX_SHARED_RX_QUEUE_DEPTH_NCLIENTS * 2];
+    txDescriptors = new BufferDescriptor[MAX_TX_QUEUE_DEPTH_NCLIENTS];
 }
 
 void resetCycles(uint8_t tid){
